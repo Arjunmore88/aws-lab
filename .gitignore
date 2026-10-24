@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Build artifacts
+*.zip
+build/
+dist/
+.aws-sam/
+
+# Local environment / secrets
+.env
+*.env
+*.pem
+.aws/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

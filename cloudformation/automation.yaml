@@ -1,0 +1,360 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  aws-lab automation layer - Python Lambda functions for office-hours EC2
+  scheduling and a weekly report-only cost hygiene scan, invoked by
+  EventBridge Scheduler with least-privilege IAM roles.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-lab
+    AllowedPattern: "^[a-z][a-z0-9-]{1,30}$"
+    Description: Must match the ProjectName used for the monitoring stack.
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Must match the Environment used for the monitoring stack.
+  Owner:
+    Type: String
+    Default: platform-team
+    Description: Team or person responsible for these resources.
+  CostCenter:
+    Type: String
+    Default: CC-1001
+    Description: Cost center used for billing allocation.
+  CodeBucket:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: S3 bucket that holds the zipped Lambda code (created by scripts/deploy.sh).
+  SchedulerCodeKey:
+    Type: String
+    Description: S3 key of the ec2_scheduler zip.
+  CostReportCodeKey:
+    Type: String
+    Description: S3 key of the cost_hygiene_report zip.
+  ScheduleTimezone:
+    Type: String
+    Default: Asia/Kolkata
+    Description: IANA time zone used for the office-hours schedules.
+  StartCron:
+    Type: String
+    Default: cron(0 8 ? * MON-FRI *)
+    Description: When to start tagged instances (EventBridge Scheduler cron, in ScheduleTimezone).
+  StopCron:
+    Type: String
+    Default: cron(0 20 ? * MON-FRI *)
+    Description: When to stop tagged instances (EventBridge Scheduler cron, in ScheduleTimezone).
+  CostReportCron:
+    Type: String
+    Default: cron(0 9 ? * MON *)
+    Description: When to run the cost hygiene report (EventBridge Scheduler cron, in ScheduleTimezone).
+  SnapshotMaxAgeDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    Description: Snapshots older than this many days are listed in the cost report.
+  SchedulesEnabled:
+    Type: String
+    Default: ENABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Description: Set to DISABLED to deploy the functions without activating the schedules.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+    Description: CloudWatch Logs retention for the Lambda log groups.
+
+Mappings:
+  Defaults:
+    ScheduleTag:
+      Key: Schedule
+      Value: office-hours
+
+Resources:
+  # ------------------------------------------------------------ log groups
+  # Created explicitly so retention is enforced and IAM can be scoped to them.
+  SchedulerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-${Environment}-ec2-scheduler
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  CostReportLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-${Environment}-cost-hygiene-report
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # ------------------------------------------------------------- IAM roles
+  SchedulerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: ec2_scheduler - describe instances, start/stop only opted-in instances
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ec2-scheduler
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt SchedulerLogGroup.Arn
+              - Sid: DescribeInstances
+                Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              - Sid: StartStopOnlyTaggedInstances
+                Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Schedule: !FindInMap [Defaults, ScheduleTag, Value]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  CostReportFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: cost_hygiene_report - read-only EC2 describe calls and publish to the alert topic
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cost-hygiene-report
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CostReportLogGroup.Arn
+              - Sid: ReadOnlyDescribe
+                Effect: Allow
+                Action:
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeSnapshots
+                Resource: "*"
+              - Sid: PublishReport
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !ImportValue
+                  Fn::Sub: ${ProjectName}-${Environment}-AlertTopicArn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # -------------------------------------------------------------- functions
+  SchedulerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SchedulerLogGroup
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-ec2-scheduler
+      Description: Stops/starts EC2 instances tagged Schedule=office-hours
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: handler.lambda_handler
+      Role: !GetAtt SchedulerFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref SchedulerCodeKey
+      Environment:
+        Variables:
+          SCHEDULE_TAG_KEY: !FindInMap [Defaults, ScheduleTag, Key]
+          SCHEDULE_TAG_VALUE: !FindInMap [Defaults, ScheduleTag, Value]
+          DRY_RUN: "false"
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  CostReportFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CostReportLogGroup
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-cost-hygiene-report
+      Description: Report-only scan for unattached EBS, idle EIPs and old snapshots
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: handler.lambda_handler
+      Role: !GetAtt CostReportFunctionRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CostReportCodeKey
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !ImportValue
+            Fn::Sub: ${ProjectName}-${Environment}-AlertTopicArn
+          SNAPSHOT_MAX_AGE_DAYS: !Ref SnapshotMaxAgeDays
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # ------------------------------------------------- EventBridge Scheduler
+  InvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Allows EventBridge Scheduler to invoke only the aws-lab automation functions
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-automation-functions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt SchedulerFunction.Arn
+                  - !GetAtt CostReportFunction.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  StartInstancesSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-start-office-hours
+      Description: Start Schedule=office-hours instances on weekday mornings
+      ScheduleExpression: !Ref StartCron
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      State: !Ref SchedulesEnabled
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt SchedulerFunction.Arn
+        RoleArn: !GetAtt InvokeRole.Arn
+        Input: '{"action": "start"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+
+  StopInstancesSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-stop-office-hours
+      Description: Stop Schedule=office-hours instances on weekday evenings
+      ScheduleExpression: !Ref StopCron
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      State: !Ref SchedulesEnabled
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt SchedulerFunction.Arn
+        RoleArn: !GetAtt InvokeRole.Arn
+        Input: '{"action": "stop"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+
+  CostReportSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-weekly-cost-hygiene
+      Description: Weekly report-only cost hygiene scan
+      ScheduleExpression: !Ref CostReportCron
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      State: !Ref SchedulesEnabled
+      FlexibleTimeWindow:
+        Mode: FLEXIBLE
+        MaximumWindowInMinutes: 30
+      Target:
+        Arn: !GetAtt CostReportFunction.Arn
+        RoleArn: !GetAtt InvokeRole.Arn
+        Input: "{}"
+        RetryPolicy:
+          MaximumRetryAttempts: 1
+
+Outputs:
+  SchedulerFunctionName:
+    Description: Name of the EC2 scheduler function
+    Value: !Ref SchedulerFunction
+  CostReportFunctionName:
+    Description: Name of the cost hygiene report function
+    Value: !Ref CostReportFunction

@@ -1,0 +1,43 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListOnlyAppPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::example-company-app-assets",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "uploads/",
+            "uploads/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ReadWriteObjectsUnderAppPrefix",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::example-company-app-assets/uploads/*"
+    },
+    {
+      "Sid": "DenyUnencryptedTransport",
+      "Effect": "Deny",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::example-company-app-assets",
+        "arn:aws:s3:::example-company-app-assets/*"
+      ],
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "false"
+        }
+      }
+    }
+  ]
+}
